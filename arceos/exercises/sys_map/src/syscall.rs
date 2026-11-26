@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use core::ffi::{c_void, c_char, c_int};
+use alloc::vec;
 use axhal::arch::TrapFrame;
 use axhal::trap::{register_trap_handler, SYSCALL};
 use axerrno::LinuxError;
@@ -8,6 +9,7 @@ use axtask::current;
 use axtask::TaskExtRef;
 use axhal::paging::MappingFlags;
 use arceos_posix_api as api;
+use memory_addr::{align_up_4k, MemoryAddr, VirtAddr, VirtAddrRange};
 
 const SYS_IOCTL: usize = 29;
 const SYS_OPENAT: usize = 56;
@@ -131,16 +133,61 @@ fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
     ret
 }
 
-#[allow(unused_variables)]
 fn sys_mmap(
     addr: *mut usize,
     length: usize,
     prot: i32,
     flags: i32,
     fd: i32,
-    _offset: isize,
+    offset: isize,
 ) -> isize {
-    unimplemented!("no sys_mmap!");
+    syscall_body!(sys_mmap, {
+        if length == 0 || offset < 0 {
+            return Err(LinuxError::EINVAL);
+        }
+        let aligned_len = align_up_4k(length);
+        let prot_flags = MmapProt::from_bits_truncate(prot);
+        let map_flags: MappingFlags = prot_flags.into();
+        let mmap_flags = MmapFlags::from_bits_truncate(flags);
+
+        let curr = current();
+        let mut aspace = curr.task_ext().aspace.lock();
+        let limit = VirtAddrRange::from_start_size(aspace.base(), aspace.size());
+        let hint = VirtAddr::from(addr as usize);
+
+        let start_addr = if mmap_flags.contains(MmapFlags::MAP_FIXED) {
+            hint.align_down_4k()
+        } else {
+            let search_hint = if hint.as_usize() == 0 {
+                aspace.base()
+            } else {
+                hint.align_down_4k()
+            };
+            aspace
+                .find_free_area(search_hint, aligned_len, limit)
+                .ok_or(LinuxError::ENOMEM)?
+        };
+
+        aspace
+            .map_alloc(start_addr, aligned_len, map_flags, true)
+            .map_err(|_| LinuxError::ENOMEM)?;
+
+        if !mmap_flags.contains(MmapFlags::MAP_ANONYMOUS) && fd >= 0 {
+            if offset > 0 {
+                api::sys_lseek(fd, offset as _, 0);
+            }
+            let file = api::get_file_like(fd)?;
+            let mut buf = vec![0u8; length];
+            let n = file.read(&mut buf)?;
+            if n > 0 {
+                aspace
+                    .write(start_addr, &buf[..n])
+                    .map_err(|_| LinuxError::EFAULT)?;
+            }
+        }
+
+        Ok(start_addr.as_usize() as isize)
+    })
 }
 
 fn sys_openat(dfd: c_int, fname: *const c_char, flags: c_int, mode: api::ctypes::mode_t) -> isize {

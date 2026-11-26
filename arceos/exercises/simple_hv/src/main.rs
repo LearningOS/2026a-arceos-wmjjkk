@@ -25,7 +25,7 @@ use vcpu::_run_guest;
 use sbi::SbiMessage;
 use loader::load_vm_image;
 use axhal::mem::PhysAddr;
-use crate::regs::GprIndex::{A0, A1};
+use crate::regs::GprIndex::{self, A0, A1};
 
 const VM_ENTRY: usize = 0x8020_0000;
 
@@ -39,6 +39,12 @@ fn main() {
     // Load vm binary file into address space.
     if let Err(e) = load_vm_image("/sbin/skernel2", &mut uspace) {
         panic!("Cannot load app! {:?}", e);
+    }
+
+    // Disable IRQs and supervisor timer interrupt so host timer does not preempt guest execution.
+    axhal::arch::disable_irqs();
+    unsafe {
+        riscv::register::sie::clear_stimer();
     }
 
     // Setup context to prepare to enter guest mode.
@@ -102,16 +108,37 @@ fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
             }
         },
         Trap::Exception(Exception::IllegalInstruction) => {
+            let inst = stval::read() as u32;
+            let opcode = inst & 0x7f;
+            let funct3 = (inst >> 12) & 0x7;
+            let csr = (inst >> 20) & 0xfff;
+            if opcode == 0x73 && funct3 == 0x2 && csr == 0xf14 {
+                // Emulate `csrr rd, mhartid`
+                let rd = GprIndex::from_raw((inst >> 7) & 0x1f).unwrap();
+                ctx.guest_regs.gprs.set_reg(rd, 0x1234);
+                ctx.guest_regs.sepc += 4;
+                return false;
+            }
             panic!("Bad instruction: {:#x} sepc: {:#x}",
                 stval::read(),
                 ctx.guest_regs.sepc
             );
         },
         Trap::Exception(Exception::LoadGuestPageFault) => {
-            panic!("LoadGuestPageFault: stval{:#x} sepc: {:#x}",
-                stval::read(),
-                ctx.guest_regs.sepc
-            );
+            let htinst: usize;
+            unsafe {
+                core::arch::asm!("csrr {}, 0x64a", out(reg) htinst);
+            }
+            let (rd, inst_len) = if htinst != 0 {
+                let rd = GprIndex::from_raw(((htinst >> 7) & 0x1f) as u32).unwrap_or(A0);
+                let len = if (htinst & 0x2) != 0 { 4 } else { 2 };
+                (rd, len)
+            } else {
+                (A0, 4)
+            };
+            ctx.guest_regs.gprs.set_reg(rd, 0x6688);
+            ctx.guest_regs.sepc += inst_len;
+            return false;
         },
         _ => {
             panic!(
